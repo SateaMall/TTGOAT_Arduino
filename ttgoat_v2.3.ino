@@ -4,8 +4,6 @@
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
-#include <string.h>
-#include <stdlib.h>
 
 // Définition des pins
 #define LED_PIN 2
@@ -30,6 +28,7 @@ String staPassword = "";
 // Variables pour le BLE
 BLEServer *pBLEServer = nullptr;
 BLECharacteristic *pCharacteristic = nullptr;
+bool isBLEServerRunning = false;
 
 // UUID pour le service BLE
 #define SERVICE_UUID        "4fafc201-1fb5-459e-8fcc-c5c9c331914b"
@@ -39,12 +38,17 @@ BLECharacteristic *pCharacteristic = nullptr;
 bool ledAutoMode = false;     // Mode LED automatique activé/désactivé
 bool isPhotoresistorPageActive = false; // Flag pour savoir si la page du capteur est active
 
+// Variable pour savoir si le serveur est en cours d'exécution
+bool isServerRunning = false;
+
 // Prototypes des fonctions
 void startBLEServer();
 void stopBLEServer();
+void stopWiFi();
 void connectToWiFiSTA();
 void handleRoot();
 void handleModeSelection();
+void setupServerRoutes();
 
 // Fonctions supplémentaires
 void handleGPIOControl();
@@ -61,35 +65,56 @@ void handlePhotoresistorPage();
 // Classe de rappel pour le BLE
 class MyCallbacks: public BLECharacteristicCallbacks {
   void onWrite(BLECharacteristic *pCharacteristic) {
-    String rxValue = pCharacteristic->getValue();
+    String rxValueStd = pCharacteristic->getValue();
+    String rxValue = String(rxValueStd.c_str());
 
     if (rxValue.length() > 0) {
       Serial.print("Valeur reçue via BLE: ");
-      Serial.println(rxValue.c_str());
+      Serial.println(rxValue);
 
-      if (rxValue.substring(0, 8) == "SET_MODE") {
+      if (rxValue.startsWith("SET_MODE")) {
         // Commande pour changer de mode
         int colon1 = rxValue.indexOf(':');
         int colon2 = rxValue.indexOf(':', colon1 + 1);
         int colon3 = rxValue.indexOf(':', colon2 + 1);
 
-        String mode = rxValue.substring(colon1 + 1, colon2 - colon1 - 1);
+        if (colon1 != -1 && colon2 != -1) {
+          String mode = rxValue.substring(colon1 + 1, colon2);
+          String ssid = "";
+          String password = "";
 
-        if (mode == "AP") {
-          apSSID = rxValue.substring(colon2 + 1, colon3 - colon2 - 1).c_str();
-          apPassword = rxValue.substring(colon3 + 1).c_str();
-          connectionMode = "AP";
-          Serial.println("Demande de passage en mode AP via BLE");
-        } else if (mode == "STA") {
-          staSSID = rxValue.substring(colon2 + 1, colon3 - colon2 - 1).c_str();
-          staPassword = rxValue.substring(colon3 + 1).c_str();
-          connectionMode = "STA";
-          Serial.println("Demande de passage en mode STA via BLE");
-        } else if (mode == "BLE") {
-          connectionMode = "BLE";
-          Serial.println("Demande de rester en mode BLE via BLE");
+          if (colon3 != -1) {
+            ssid = rxValue.substring(colon2 + 1, colon3);
+            password = rxValue.substring(colon3 + 1);
+          } else {
+            ssid = rxValue.substring(colon2 + 1);
+          }
+
+          Serial.print("Mode reçu via BLE: ");
+          Serial.println(mode);
+          Serial.print("SSID reçu via BLE: ");
+          Serial.println(ssid);
+          Serial.print("Password reçu via BLE: ");
+          Serial.println(password);
+
+          if (mode == "AP") {
+            apSSID = ssid;
+            apPassword = password;
+            connectionMode = "AP";
+            Serial.println("Demande de passage en mode AP via BLE");
+          } else if (mode == "STA") {
+            staSSID = ssid;
+            staPassword = password;
+            connectionMode = "STA";
+            Serial.println("Demande de passage en mode STA via BLE");
+          } else if (mode == "BLE") {
+            connectionMode = "BLE";
+            Serial.println("Demande de rester en mode BLE via BLE");
+          } else {
+            Serial.println("Mode inconnu reçu via BLE");
+          }
         } else {
-          Serial.println("Mode inconnu reçu via BLE");
+          Serial.println("Commande SET_MODE mal formatée");
         }
       } else if (rxValue == "LED_ON") {
         digitalWrite(LED_PIN, HIGH);
@@ -100,6 +125,19 @@ class MyCallbacks: public BLECharacteristicCallbacks {
       }
       // Ajoutez d'autres commandes si nécessaire
     }
+  }
+};
+
+// Classe de rappel pour le serveur BLE
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer* pServer) {
+    Serial.println("Client BLE connecté");
+  }
+
+  void onDisconnect(BLEServer* pServer) {
+    Serial.println("Client BLE déconnecté");
+    pServer->getAdvertising()->start();
+    Serial.println("Reprise de l'advertising BLE");
   }
 };
 
@@ -122,6 +160,8 @@ const char index_html[] PROGMEM = R"rawliteral(
 
 void setup() {
   Serial.begin(115200);
+  Serial.println("Démarrage de l'ESP32...");
+
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW); // Éteindre la LED au démarrage
 
@@ -130,20 +170,34 @@ void setup() {
   pinMode(buzzerPin, OUTPUT);
   digitalWrite(buzzerPin, LOW);
 
-  // Démarrer en mode BLE par défaut
-  startBLEServer();
+  // Démarrer en mode AP par défaut
+  WiFi.mode(WIFI_MODE_AP);
+  WiFi.softAP(apSSID.c_str(), apPassword.c_str());
+  Serial.println("Mode AP démarré par défaut");
+  Serial.print("SSID: ");
+  Serial.println(apSSID);
+  Serial.print("Adresse IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // Démarrer le serveur web
+  setupServerRoutes();
+  server.begin();
+  isServerRunning = true;
+  Serial.println("Serveur web démarré en mode AP");
 }
 
 void loop() {
   // Si le mode de connexion a été défini, basculer vers ce mode
   if (connectionMode == "STA") {
     Serial.println("Bascule vers le mode STA");
-    stopBLEServer(); // Arrêter le serveur BLE
+    stopBLEServer();
+    stopWiFi();
     connectToWiFiSTA();
-    connectionMode = ""; // Réinitialiser pour éviter de reboucler
+    connectionMode = "";
   } else if (connectionMode == "AP") {
-    Serial.println("Bascule vers le mode AP");
-    stopBLEServer(); // Arrêter le serveur BLE
+    Serial.println("Bascule vers le mode AP avec les nouveaux paramètres");
+    stopBLEServer();
+    stopWiFi();
     WiFi.mode(WIFI_MODE_AP);
     WiFi.softAP(apSSID.c_str(), apPassword.c_str());
     Serial.println("Mode AP démarré avec les nouveaux paramètres");
@@ -151,11 +205,22 @@ void loop() {
     Serial.println(apSSID);
     Serial.print("Adresse IP: ");
     Serial.println(WiFi.softAPIP());
+    setupServerRoutes();
     server.begin();
-    connectionMode = ""; // Réinitialiser pour éviter de reboucler
+    isServerRunning = true;
+    Serial.println("Serveur web redémarré en mode AP");
+    connectionMode = "";
   } else if (connectionMode == "BLE") {
-    // Déjà en mode BLE, ne rien faire
-    connectionMode = ""; // Réinitialiser
+    Serial.println("Bascule vers le mode BLE");
+    stopWiFi();
+    stopBLEServer();
+    startBLEServer();
+    connectionMode = "";
+  }
+
+  // Traiter les requêtes du serveur web si actif
+  if (isServerRunning) {
+    server.handleClient();
   }
 
   // Mettre à jour le capteur de lumière si la page est active
@@ -163,16 +228,43 @@ void loop() {
     updatePhotoresistor();   // Lire le capteur et gérer la LED
   }
 
-  delay(100); // Petit délai pour éviter de monopoliser le CPU
+  delay(10); // Petit délai pour éviter de monopoliser le CPU
+}
+
+// Fonction pour arrêter le Wi-Fi proprement
+void stopWiFi() {
+  if (WiFi.getMode() != WIFI_MODE_NULL) {
+    Serial.println("Arrêt du Wi-Fi");
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_MODE_NULL);
+    isServerRunning = false;
+    server.stop();
+  }
+}
+
+// Fonction pour configurer les routes du serveur web
+void setupServerRoutes() {
+  // Configurer les routes du serveur web
+  server.on("/", handleRoot);
+  server.on("/select_mode", HTTP_POST, handleModeSelection);
+
+  // Routes pour les fonctionnalités (vous pouvez les ajouter si nécessaire)
+  // ...
+
+  server.onNotFound([](){
+    server.send(404, "text/plain", "Not Found");
+  });
 }
 
 // Fonction pour gérer la page d'accueil
 void handleRoot() {
+  Serial.println("Requête GET reçue pour /");
   server.send_P(200, "text/html", index_html);
 }
 
 // Fonction pour gérer la sélection du mode
 void handleModeSelection() {
+  Serial.println("Requête POST reçue pour /select_mode");
   if (server.hasArg("mode")) {
     connectionMode = server.arg("mode");
     Serial.print("Mode sélectionné: ");
@@ -185,6 +277,7 @@ void handleModeSelection() {
         server.send(200, "text/plain", "Bascule vers le mode STA...");
       } else {
         server.send(400, "text/plain", "SSID et mot de passe requis pour le mode STA");
+        Serial.println("SSID et mot de passe manquants pour le mode STA");
         connectionMode = ""; // Réinitialiser le mode car les infos sont manquantes
       }
     } else if (connectionMode == "AP") {
@@ -194,16 +287,19 @@ void handleModeSelection() {
         server.send(200, "text/plain", "Bascule vers le mode AP avec les nouveaux paramètres...");
       } else {
         server.send(400, "text/plain", "SSID et mot de passe requis pour le mode AP");
+        Serial.println("SSID et mot de passe manquants pour le mode AP");
         connectionMode = ""; // Réinitialiser le mode car les infos sont manquantes
       }
     } else if (connectionMode == "BLE") {
-      server.send(200, "text/plain", "Reste en mode BLE");
+      server.send(200, "text/plain", "Bascule vers le mode BLE...");
     } else {
       server.send(400, "text/plain", "Mode inconnu");
+      Serial.println("Mode inconnu sélectionné");
       connectionMode = ""; // Réinitialiser le mode car invalide
     }
   } else {
     server.send(400, "text/plain", "Aucun mode sélectionné");
+    Serial.println("Aucun mode sélectionné dans la requête");
   }
 }
 
@@ -225,63 +321,65 @@ void connectToWiFiSTA() {
     Serial.println("\nConnecté en mode STA");
     Serial.print("Adresse IP: ");
     Serial.println(WiFi.localIP());
-    // Démarrer le serveur web en mode STA si nécessaire
+    // Démarrer le serveur web en mode STA
+    setupServerRoutes();
     server.begin();
+    isServerRunning = true;
     Serial.println("Serveur web démarré en mode STA");
-
-    // Configurer les routes du serveur web
-    server.on("/", handleRoot);
-    server.on("/select_mode", HTTP_POST, handleModeSelection);
-
-    // Routes pour les fonctionnalités
-    server.on("/control_gpio", handleGPIOControl);
-    server.on("/play_song", handlePlaySong);
-    server.on("/photoresistor", handlePhotoresistorPage);  // Page pour afficher la luminosité
-    server.on("/get_photoresistor", handleGetPhotoresistorValue); // Obtenir les valeurs du capteur
-    server.on("/exit_photoresistor", handlePhotoresistorExit);  // Route pour désactiver la lecture
-    server.on("/toggle_led_auto", handleToggleLedAuto);
-    server.on("/get_led_auto_state", handleGetLedAutoState);
-
-    server.onNotFound([](){
-      server.send(404, "text/plain", "Not Found");
-    });
-
   } else {
     Serial.println("\nImpossible de se connecter au réseau Wi-Fi");
-    // Revenir en mode BLE pour réessayer
-    startBLEServer();
-    Serial.println("Revenu en mode BLE");
+    // Revenir en mode AP pour réessayer
+    WiFi.mode(WIFI_MODE_AP);
+    WiFi.softAP(apSSID.c_str(), apPassword.c_str());
+    Serial.println("Revenu en mode AP par défaut");
+    Serial.print("SSID: ");
+    Serial.println(apSSID);
+    Serial.print("Adresse IP: ");
+    Serial.println(WiFi.softAPIP());
+    setupServerRoutes();
+    server.begin();
+    isServerRunning = true;
+    Serial.println("Serveur web redémarré en mode AP");
   }
 }
 
 // Fonctions pour le BLE
 void startBLEServer() {
-  BLEDevice::init("ESP32_BLE");
-  pBLEServer = BLEDevice::createServer();
+  if (!isBLEServerRunning) {
+    Serial.println("Démarrage du serveur BLE...");
+    BLEDevice::init("ESP32_BLE");
+    pBLEServer = BLEDevice::createServer();
+    pBLEServer->setCallbacks(new MyServerCallbacks());
 
-  BLEService *pService = pBLEServer->createService(SERVICE_UUID);
+    BLEService *pService = pBLEServer->createService(SERVICE_UUID);
 
-  pCharacteristic = pService->createCharacteristic(
-                      CHARACTERISTIC_UUID,
-                      BLECharacteristic::PROPERTY_READ |
-                      BLECharacteristic::PROPERTY_WRITE
-                    );
+    pCharacteristic = pService->createCharacteristic(
+                        CHARACTERISTIC_UUID,
+                        BLECharacteristic::PROPERTY_READ |
+                        BLECharacteristic::PROPERTY_WRITE
+                      );
 
-  pCharacteristic->setCallbacks(new MyCallbacks());
-  pCharacteristic->setValue("Hello BLE");
-  pService->start();
+    pCharacteristic->setCallbacks(new MyCallbacks());
+    pCharacteristic->setValue("Hello BLE");
+    pService->start();
 
-  BLEAdvertising *pAdvertising = pBLEServer->getAdvertising();
-  pAdvertising->start();
+    BLEAdvertising *pAdvertising = pBLEServer->getAdvertising();
+    pAdvertising->start();
 
-  Serial.println("Serveur BLE démarré");
+    isBLEServerRunning = true;
+    Serial.println("Serveur BLE démarré");
+  } else {
+    Serial.println("Le serveur BLE est déjà en cours d'exécution");
+  }
 }
 
 void stopBLEServer() {
-  if (pBLEServer != nullptr) {
+  if (isBLEServerRunning && pBLEServer != nullptr) {
+    Serial.println("Arrêt du serveur BLE...");
     pBLEServer->getAdvertising()->stop();
     pBLEServer->removeService(pBLEServer->getServiceByUUID(SERVICE_UUID));
     BLEDevice::deinit(true);
+    isBLEServerRunning = false;
     Serial.println("Serveur BLE arrêté");
   }
 }
